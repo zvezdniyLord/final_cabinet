@@ -35,24 +35,71 @@ const transporter = nodemailer.createTransport({
     }
 });
 
-const supportEmail = 'mailuser@mail.devsanya.ru'
+const supportEmail = 'mailuser@mail.devsanya.ru';
+//const supportEmail = 'devsanya.ru';
 const siteSenderEmail = 'devsanya.ru';
 
 async function sendEmail(to, subject, text, html, options = {}) {
+    console.log(`\n--- sendEmail CALLED ---`);
+    console.log(`Initial params: to=${to}, subject="${subject}"`);
+    console.log(`Options:`, JSON.stringify(options, null, 2)); // Логируем все переданные опции
+
     try {
-        let finalSubject = subject;
-        // Добавляем номер заявки и/или ID треда в тему, если они есть и еще не добавлены
-        if (options.ticketNumber && !finalSubject.includes(`[Ticket#${options.ticketNumber}]`)) {
-            finalSubject = `${finalSubject} [Ticket#${options.ticketNumber}]`;
-        }
-        if (options.threadId && !finalSubject.includes(`[Thread#${options.threadId}]`)) {
-            finalSubject = `${finalSubject} [Thread#${options.threadId}]`;
+        let finalSubject = subject; // Начинаем с исходной темы
+
+        // 1. Обработка идентификатора тикета
+        if (options.ticketNumber) {
+            const ticketIdNumber = options.ticketNumber;
+            const mainTicketMarker = `#${ticketIdNumber}:`;
+            const fullTicketPattern = `Заявка ${mainTicketMarker}`;
+
+            console.log(`sendEmail DBG: Processing ticketNumber: ${ticketIdNumber}. Target pattern: "${fullTicketPattern}"`);
+
+            // Удаляем любые предыдущие формы идентификаторов, чтобы избежать дублирования или конфликтов
+            let tempSubject = finalSubject
+                .replace(/\[Ticket#[a-zA-Z0-9\-]+\]/gi, '') // Удаляем [Ticket#...]
+                .replace(/Заявка\s*#\d+:/gi, '')          // Удаляем "Заявка #ЧИСЛО:"
+                .replace(/#\d+:/gi, '');                   // Удаляем одиночные #ЧИСЛО:
+
+            // Убираем лишние "Re: " если они дублируются или стоят перед пустым местом
+            tempSubject = tempSubject.replace(/^(Re:\s*)+/i, 'Re: ').trim();
+            if (tempSubject.toLowerCase() === 're:') { // Если остался только "Re: "
+                tempSubject = ''; // Сделаем тему пустой, чтобы корректно добавить наш паттерн
+            } else if (tempSubject.toLowerCase().startsWith('re:')) {
+                // Если есть "Re: ", оставляем его и работаем с остальной частью темы
+                tempSubject = tempSubject.substring(3).trim();
+            }
+
+            tempSubject = tempSubject.trim(); // Убираем пробелы по краям после всех замен
+
+            console.log(`sendEmail DBG: Subject after cleaning old markers: "${tempSubject}"`);
+
+            // Теперь формируем новую тему с нашим главным идентификатором
+            if (subject.toLowerCase().startsWith('re:')) { // Используем исходный subject для проверки Re:
+                finalSubject = `Re: ${fullTicketPattern} ${tempSubject}`;
+            } else {
+                finalSubject = `${fullTicketPattern} ${tempSubject}`;
+            }
+            console.log(`sendEmail DBG: Subject after adding main ticket pattern: "${finalSubject}"`);
+
+        } else {
+            console.log(`sendEmail DBG: options.ticketNumber is NOT provided. Subject will not be modified for ticket ID, only thread ID if present.`);
         }
 
+        // 2. Добавляем Thread ID, если он есть и еще не добавлен
+        if (options.threadId && !finalSubject.includes(`[Thread#${options.threadId}]`)) {
+            finalSubject = `${finalSubject.trim()} [Thread#${options.threadId}]`;
+            console.log(`sendEmail DBG: Subject after adding threadId: "${finalSubject}"`);
+        }
+
+        // Финальная очистка от лишних пробелов
+        finalSubject = finalSubject.replace(/\s\s+/g, ' ').trim();
+        console.log(`sendEmail DBG: finalSubject before sending: "${finalSubject}"`);
+
         const mailOptions = {
-            from: `"${options.fromName || 'Ваш Сайт ИНТ'}" <${siteSenderEmail}>`,
+            from: `"${options.fromName || 'Ваш Сайт ИНТ'}" <${siteSenderEmail}>`, // siteSenderEmail должен быть определен
             to: to,
-            subject: subject,
+            subject: finalSubject,
             text: text,
             html: html,
             replyTo: options.replyTo || undefined,
@@ -60,25 +107,19 @@ async function sendEmail(to, subject, text, html, options = {}) {
             headers: {}
         };
 
-        // Добавляем заголовки для правильной группировки писем в почтовых клиентах
         if (options.threadId) {
-            // Можно использовать threadId как часть Message-ID для первого письма в треде,
-            // но nodemailer обычно генерирует свой Message-ID.
-            // Мы можем использовать threadId для заголовка X-Thread-ID или другого кастомного.
             mailOptions.headers['X-Thread-ID'] = options.threadId;
-
             if (options.inReplyToMessageId) {
                 mailOptions.inReplyTo = options.inReplyToMessageId;
-                // References: сначала старые ID, потом ID, на которое отвечаем
                 mailOptions.references = options.references ? `${options.references} ${options.inReplyToMessageId}` : options.inReplyToMessageId;
             }
         }
 
-        const info = await transporter.sendMail(mailOptions);
-        console.log(`Email sent successfully to ${to}. Message ID: ${info.messageId}`);
+        const info = await transporter.sendMail(mailOptions); // transporter должен быть определен
+        console.log(`Email sent successfully to ${to} (Actual Sent Subject: "${finalSubject}"). Message ID: ${info.messageId}`);
 
-        // Опционально: сохраняем исходящее письмо в вашу таблицу 'emails'
-        if (options.saveToDb !== false && pool) { // pool - это ваш экземпляр pg.Pool
+        // Логирование в БД (если нужно)
+        if (options.saveToDb !== false && typeof pool !== 'undefined' && pool) { // pool должен быть определен
             let client;
             try {
                 client = await pool.connect();
@@ -86,35 +127,36 @@ async function sendEmail(to, subject, text, html, options = {}) {
                     `INSERT INTO emails (thread_id, subject, body, from_email, is_outgoing, created_at, user_id)
                      VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, $6)`,
                     [
-                        options.threadId || null, // Если нет threadId, можно оставить null или генерировать
-                        subject,
-                        text, // Сохраняем текстовую версию
-                        siteSenderEmail, // Отправитель - системный email
-                        true, // is_outgoing = true
-                        options.userIdForLog || null // ID пользователя, инициировавшего отправку, или null
+                        options.threadId || null,
+                        finalSubject,
+                        text,
+                        siteSenderEmail,
+                        true,
+                        options.userIdForLog || null
                     ]
                 );
                 console.log(`Outgoing email (to: ${to}, subject: ${finalSubject}) logged to DB.`);
             } catch (dbError) {
                 console.error('Error logging outgoing email to database:', dbError);
-                // Не прерываем основной процесс из-за ошибки логирования
             } finally {
                 if (client) client.release();
             }
         }
-
+        console.log(`--- sendEmail END ---\n`);
         return {
-            messageId: info.messageId, // Это Message-ID, сгенерированный почтовым сервером
-            threadId: options.threadId // Возвращаем переданный или сгенерированный threadId
+            messageId: info.messageId,
+            threadId: options.threadId
         };
 
     } catch (error) {
-        console.error(`Error sending email to ${to} with subject "${subject}":`, error);
-        // Пробрасываем ошибку дальше, чтобы вызывающий код мог ее обработать
-        // (например, показать пользователю сообщение об ошибке или записать в лог более подробно)
+        // Попытка получить finalSubject для лога ошибки, если он был изменен
+        const subjectForErrorLog = (typeof finalSubject !== 'undefined' && finalSubject !== subject) ? finalSubject : subject;
+        console.error(`Error sending email to ${to} with initial subject "${subject}" (attempted final subject: "${subjectForErrorLog}"):`, error);
+        console.log(`--- sendEmail ERROR END ---\n`);
         throw error;
     }
 }
+
 
 app.use(helmet()); // Устанавливает безопасные HTTP заголовки
 
@@ -378,11 +420,6 @@ app.put('/api/user/profile', verifyToken, async (req, res) => {
     }
 });
 
-// Добавьте в .env файл
-// ADMIN_PASSWORD=ваш_сложный_пароль_администратора
-// ADMIN_JWT_SECRET=другой_секретный_ключ_для_админских_токенов
-
-// Эндпоинт для входа администратора
 app.post('/api/admin/login', async (req, res) => {
     const { password } = req.body;
 
@@ -565,7 +602,9 @@ const fileFilter = (req, file, cb) => {
             file.mimetype === 'application/msword' ||
             file.mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
             file.mimetype === 'application/vnd.ms-excel' ||
-            file.mimetype === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            file.mimetype === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
+            file.mimetype === 'image/png' ||
+            file.mimetype === 'image/jpeg'
         ) {
             cb(null, true);
         } else {
@@ -923,7 +962,7 @@ app.post('/api/tickets', verifyToken, upload.array('attachments', 5), async (req
 
         // Получаем полное имя пользователя из БД
         const userDetailsResult = await client.query('SELECT fio FROM users WHERE id = $1', [userId]);
-        const senderName = userDetailsResult.rows.length > 0 ? userDetailsResult.rows[0].full_name : userEmailFromToken;
+        const senderName = userDetailsResult.rows.length > 0 ? userDetailsResult.rows[0].fio : userEmailFromToken;
 
         // 1. Создаем запись о заявке в таблице 'tickets'
         const ticketInsertResult = await client.query(
@@ -1349,7 +1388,8 @@ app.post('/api/tickets/:ticketNumber/messages', verifyToken, upload.array('attac
                     threadId: ticket.email_thread_id,
                     userId: userId,
                     saveToDb: true,
-                    attachments: attachments
+                    attachments: attachments,
+                    ticketNumber: ticketNumber
                 }
             );
         } catch (emailError) {
@@ -1559,49 +1599,107 @@ app.post('/api/tickets/:ticketNumber/reopen', verifyToken, async (req, res) => {
     } finally {
         if (client) client.release();
     }
-})
+});
+
+async function decodeMimeEncodedString(mimeString) {
+    if (!mimeString || typeof mimeString !== 'string' || !mimeString.startsWith('=?') || !mimeString.endsWith('?=')) {
+        return mimeString; // Возвращаем как есть, если не похоже на MIME
+    }
+    try {
+        const emailSource = `Subject: ${mimeString}\n\n`;
+        const parsedEmail = await simpleParser(emailSource);
+        return parsedEmail.subject || mimeString;
+    } catch (error) {
+        console.error("Error decoding MIME string with mailparser:", error);
+        return mimeString; // В случае ошибки возвращаем исходную строку, чтобы не прерывать поток
+    }
+}
+
+function extractTicketInfo(decodedSubject) {
+    // decodedSubject - это уже РАСКОДИРОВАННАЯ строка темы
+    if (!decodedSubject || typeof decodedSubject !== 'string') {
+        return { ticketNumber: null, message: "Decoded subject is invalid or empty." };
+    }
+
+    let ticketNumber = null;
+    let message = "Ticket number not found with known patterns in decoded subject.";
+
+    let match = decodedSubject.match(/#([0-9]+):/i);
+    if (match && match[1]) {
+        ticketNumber = match[1];
+        message = `Ticket number '${ticketNumber}' found using pattern '#...:'.`;
+        return { ticketNumber, message };
+    }
+
+
+    match = decodedSubject.match(/\[Ticket#([a-zA-Z0-9\-]+)\]/i);
+    if (match && match[1]) {
+        ticketNumber = match[1];
+        message = `Ticket number '${ticketNumber}' found using pattern '[Ticket#...]'.`;
+        return { ticketNumber, message };
+    }
+
+    match = decodedSubject.match(/Ticket#([a-zA-Z0-9\-]+)/i);
+    if (match && match[1]) {
+        ticketNumber = match[1];
+        message = `Ticket number '${ticketNumber}' found using pattern 'Ticket#...'.`;
+        return { ticketNumber, message };
+    }
+
+    match = decodedSubject.match(/_#([0-9]+):/i);
+    if (match && match[1]) {
+        ticketNumber = match[1];
+        message = `Ticket number '${ticketNumber}' found using pattern '_#...:'.`;
+        return { ticketNumber, message };
+    }
+
+    return { ticketNumber, message }; // ticketNumber будет null, если ни один паттерн не сработал
+}
+
+
 
 // 6. Эндпоинт для обработки входящих писем от почтового сервера
 app.post('/api/receive-email', async (req, res) => {
     // 1. Защита Webhook'а
-	//console.log(req.body);
-	//console.log(req.headers['x-API-key']);
-	//console.log(process.env.EMAIL_WEBHOOK_API_KEY);
-	//console.log(JSON.stringify(req.headers, null, 2));
-    //const apiKey = req.headers['x-api-key'];
-	const apiKey = req.headers['x-api-key'];
+    const apiKey = req.headers['x-api-key'];
     if (!process.env.EMAIL_WEBHOOK_API_KEY || apiKey !== process.env.EMAIL_WEBHOOK_API_KEY) {
         console.warn('Unauthorized webhook access attempt to /api/receive-email.');
         return res.status(401).json({ message: 'Unauthorized webhook access.' });
     }
 
-    // 2. Получаем данные из тела запроса
     const { subject, body, from } = req.body;
 
-    if (!subject || !body || !from) {
-        console.warn('Webhook /api/receive-email: Missing required fields.', req.body);
-        return res.status(400).json({ message: 'Missing required fields: subject, body, from_email are required.' });
+    // Проверяем наличие обязательных полей
+    if (!subject || !body || !from) { // Используем 'subject' и 'from'
+        console.warn('Webhook /api/receive-email: Missing required fields:', req.body);
+        // Сообщение об ошибке тоже должно соответствовать:
+        return res.status(400).json({ message: 'Missing required fields: subject, body, from are required.' });
     }
-    console.log(`req.subject: ${subject}`); 
-    let ticketNumber = null;
-    //const ticketNumberMatch = subject.match(/\[Ticket#([a-zA-Z0-9\-]+)\]/i); // Ищет [Ticket#<номер_заявки>]
-    // ([a-zA-Z0-9\-]+) - означает, что номер заявки может состоять из букв, цифр и дефисов.
-    // Если ваш ticket_number только из цифр, можно использовать (\d+)
-    const ticketNumberMatch = subject.match(/=\?UTF-8\?Q\?.*?_23([0-9]+)=3A.*?\?=/i);
-    console.log(`subject: ${ticketNumberMatch}`);
-    if (ticketNumberMatch && ticketNumberMatch[1]) {
-        ticketNumber = ticketNumberMatch[1];
-        console.log(`Webhook /api/receive-email: Extracted ticket_number '${ticketNumber}' from subject.`);
-    } else {
-        console.warn(`Webhook /api/receive-email: Could not extract ticket_number from subject: "${subject}". Email will be ignored.`);
-        // Если номер заявки не найден в теме, мы не можем связать письмо с заявкой.
-        // Возвращаем 200 OK, чтобы почтовый парсер не пытался отправить снова.
+
+    console.log(`Webhook /api/receive-email: Received raw subject: "${subject}"`); // Используем 'subject'
+
+    // 2.1. Декодируем тему письма (передаем 'subject' как исходную MIME-строку)
+    const decodedSubject = await decodeMimeEncodedString(subject);
+    console.log(`Webhook /api/receive-email: Decoded subject: "${decodedSubject}"`);
+
+    // 2.2. Извлекаем номер тикета из ДЕКОДИРОВАННОЙ темы
+    const ticketInfo = extractTicketInfo(decodedSubject);
+    const ticketNumber = ticketInfo.ticketNumber;
+
+    console.log(`Webhook /api/receive-email: Ticket extraction - ${ticketInfo.message}`);
+
+    if (!ticketNumber) {
+        console.warn(`Webhook /api/receive-email: Could not extract ticket_number. Raw subject: "${subject}", Decoded: "${decodedSubject}". Email will be ignored.`);
         return res.status(200).json({ message: 'Ticket number not found in subject. Email ignored.' });
     }
+    console.log(`Webhook /api/receive-email: Successfully extracted ticket_number '${ticketNumber}'.`);
+
+    // Используем ДЕКОДИРОВАННУЮ тему для записи в БД и дальнейшей логики
+    const subjectForDb = decodedSubject;
 
     let client;
     try {
-        client = await pool.connect();
+        client = await pool.connect(); // pool должен быть определен выше
         await client.query('BEGIN');
 
         // 4. Находим заявку в БД по извлеченному ticket_number
@@ -1617,34 +1715,34 @@ app.post('/api/receive-email', async (req, res) => {
 
         if (ticketQueryResult.rows.length === 0) {
             await client.query('ROLLBACK');
-            console.warn(`Webhook /api/receive-email: Ticket not found for ticket_number: ${ticketNumber} (extracted from subject).`);
+            console.warn(`Webhook /api/receive-email: Ticket not found for ticket_number: ${ticketNumber}.`);
             return res.status(200).json({ message: `Ticket not found for ticket_number: ${ticketNumber}. Email ignored.` });
         }
         const ticket = ticketQueryResult.rows[0];
 
-        // ... (остальная логика остается такой же, как в предыдущем ответе, начиная с пункта 5)
-        // (Проверка статуса заявки, определение отправителя, сохранение в emails,
-        //  добавление в ticket_messages, обновление статуса заявки, отправка уведомлений)
-
         // 5. Определяем, кто отправитель: пользователь или техподдержка
-        let senderType = 'support';
+        let senderType = 'user';
         let senderIdForDb = ticket.user_id;
 
-        const supportEmails = (process.env.SUPPORT_EMAILS || supportEmail).split(',').map(email => email.trim().toLowerCase());
-        if (supportEmails.includes(from_email.toLowerCase())) {
+        const supportEmailEnv = process.env.SUPPORT_MAIN_EMAIL || 'default_support@example.com';
+        const supportEmailsEnv = (process.env.SUPPORT_EMAILS || supportEmailEnv).split(',').map(email => email.trim().toLowerCase());
+
+        // Используем 'from' для определения отправителя
+        if (supportEmailsEnv.includes(from.toLowerCase())) {
             senderType = 'support';
-            const supportStaffResult = await client.query('SELECT id FROM users WHERE email = $1 AND is_support = TRUE', [from_email]);
+            const supportStaffResult = await client.query('SELECT id FROM users WHERE email = $1 AND is_support = TRUE', [from]); // Используем 'from'
             senderIdForDb = supportStaffResult.rows.length > 0 ? supportStaffResult.rows[0].id : null;
-        } else if (from_email.toLowerCase() !== ticket.user_email.toLowerCase()) {
+        } else if (from.toLowerCase() !== ticket.user_email.toLowerCase()) { // Используем 'from'
             console.warn(`Webhook /api/receive-email: Email from '${from}' for ticket #${ticket.ticket_number}, but original user is '${ticket.user_email}'. Processing as user reply.`);
         }
 
-        // 6. Сохраняем входящее письмо в таблицу emails (опционально)
+        // 6. Сохраняем входящее письмо в таблицу emails
         const emailInsertResult = await client.query(
             `INSERT INTO emails (thread_id, subject, body, from_email, is_outgoing, created_at, user_id)
              VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, $6)
              RETURNING id`,
-            [ticket.email_thread_id, subject, body, from, false, (senderType === 'user' ? ticket.user_id : senderIdForDb)]
+            // Для поля from_email в БД используем переменную 'from'
+            [ticket.email_thread_id, subjectForDb, body, from, false, (senderType === 'user' ? ticket.user_id : senderIdForDb)]
         );
         const emailId = emailInsertResult.rows[0].id;
 
@@ -1653,19 +1751,20 @@ app.post('/api/receive-email', async (req, res) => {
             `INSERT INTO ticket_messages (ticket_id, sender_type, sender_id, sender_email, message, email_id)
              VALUES ($1, $2, $3, $4, $5, $6)
              RETURNING id, created_at, message_number`,
-            [ticket.id, senderType, senderIdForDb, from_email, body, emailId]
+            // Для поля sender_email в БД используем переменную 'from'
+            [ticket.id, senderType, senderIdForDb, from, body, emailId]
         );
         const newMessage = messageInsertResult.rows[0];
 
-        // 8. Обновляем статус заявки
+        // 8. Обновляем статус заявки (логика остается прежней)
         let newStatusName = ticket.status;
-        if (senderType === 'support' && (ticket.status === 'open' || ticket.status === 'in_progress')) {
+        if (senderType === 'support' && ['open', 'in_progress', 'reopened'].includes(ticket.status)) {
             newStatusName = 'waiting_for_user';
-        } else if (senderType === 'user' && ticket.status === 'waiting_for_user') {
-            newStatusName = 'open';
-        } else if (ticket.status === 'closed' && senderType === 'user') {
-            newStatusName = 'open';
-            console.log(`Ticket #${ticket.ticket_number} re-opened due to user reply via email.`);
+        } else if (senderType === 'user' && ['waiting_for_user', 'closed'].includes(ticket.status)) {
+            newStatusName = (ticket.status === 'closed') ? 'reopened' : 'open';
+            if (ticket.status === 'closed') {
+                console.log(`Webhook /api/receive-email: Ticket #${ticket.ticket_number} re-opened due to user reply.`);
+            }
         }
 
         if (newStatusName !== ticket.status) {
@@ -1675,6 +1774,10 @@ app.post('/api/receive-email', async (req, res) => {
                     `UPDATE tickets SET status_id = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
                     [newStatusResult.rows[0].id, ticket.id]
                 );
+                console.log(`Webhook /api/receive-email: Ticket #${ticket.ticket_number} status updated from '${ticket.status}' to '${newStatusName}'.`);
+            } else {
+                console.warn(`Webhook /api/receive-email: Status_id for '${newStatusName}' not found. Ticket status not changed.`);
+                await client.query(`UPDATE tickets SET updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [ticket.id]);
             }
         } else {
              await client.query(`UPDATE tickets SET updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [ticket.id]);
@@ -1683,29 +1786,34 @@ app.post('/api/receive-email', async (req, res) => {
         await client.query('COMMIT');
 
         // 9. Отправляем email-уведомление (если нужно)
-        if (senderType === 'support') { // Уведомляем пользователя
-            try {
-                await sendEmail(
-                    ticket.user_email,
-                    `Ответ по вашей заявке #${ticket.ticket_number}: ${ticket.ticket_subject}`,
-                    `Здравствуйте, ${ticket.user_name || 'Пользователь'}!\n\nСотрудник техподдержки (${from}) ответил на вашу заявку:\n\n${body}\n\nС уважением,\nТехподдержка ИНТ`,
-                    `<p>Здравствуйте, ${ticket.user_name || 'Пользователь'}!</p><p>Сотрудник техподдержки (${from}) ответил на вашу заявку #${ticket.ticket_number} (${ticket.ticket_subject}):</p><blockquote>${body.replace(/\n/g, '<br>')}</blockquote><p>С уважением,<br>Техподдержка ИНТ</p>`,
-                    { replyTo: supportEmail, threadId: ticket.email_thread_id, ticketNumber: ticket.ticket_number }
-                );
-            } catch (emailError) { console.error(`Webhook: Failed to send notification to user for ticket #${ticket.ticket_number}:`, emailError); }
-        } else if (senderType === 'user' && !supportEmails.includes(from_email.toLowerCase())) { // Уведомляем поддержку
-             try {
-                await sendEmail(
-                    supportEmail,
-                    `Новый ответ от пользователя по заявке #${ticket.ticket_number}: ${ticket.ticket_subject}`,
-                    `Пользователь ${ticket.user_name} (${from}) ответил на заявку #${ticket.ticket_number}:\n\n${body}`,
-                    `<p>Пользователь <strong>${ticket.user_name}</strong> (${from_email}) ответил на заявку #${ticket.ticket_number} (${ticket.ticket_subject}):</p><blockquote>${body.replace(/\n/g, '<br>')}</blockquote>`,
-                    { replyTo: from_email, threadId: ticket.email_thread_id, ticketNumber: ticket.ticket_number }
-                );
-            } catch (emailError) { console.error(`Webhook: Failed to send notification to support for ticket #${ticket.ticket_number}:`, emailError); }
+        if (typeof sendEmail === 'function') {
+            if (senderType === 'support') {
+                try {
+                    await sendEmail(
+                        ticket.user_email,
+                        `Ответ по вашей заявке #${ticket.ticket_number}: ${ticket.ticket_subject}`,
+                        `Здравствуйте, ${ticket.user_name || 'Пользователь'}!\n\nСотрудник техподдержки (${from}) ответил на вашу заявку:\n\n${body}\n\nС уважением,\nТехподдержка ИНТ`, // Используем 'from'
+                        `<p>Здравствуйте, ${ticket.user_name || 'Пользователь'}!</p><p>Сотрудник техподдержки (${from}) ответил на вашу заявку #${ticket.ticket_number} (${ticket.ticket_subject}):</p><blockquote>${body.replace(/\n/g, '<br>')}</blockquote><p>С уважением,<br>Техподдержка ИНТ</p>`,
+                        { replyTo: supportEmailEnv, threadId: ticket.email_thread_id, ticketNumber: ticket.ticket_number }
+                    );
+                } catch (emailError) { console.error(`Webhook: Failed to send notification to user for ticket #${ticket.ticket_number}:`, emailError); }
+            } else if (senderType === 'user' && !supportEmailsEnv.includes(from.toLowerCase())) { // Используем 'from'
+                 try {
+                    await sendEmail(
+                        supportEmailEnv,
+                        `Новый ответ от пользователя по заявке #${ticket.ticket_number}: ${ticket.ticket_subject}`,
+                        `Пользователь ${ticket.user_name} (${from}) ответил на заявку #${ticket.ticket_number}:\n\n${body}`, // Используем 'from'
+                        `<p>Пользователь <strong>${ticket.user_name}</strong> (${from}) ответил на заявку #${ticket.ticket_number} (${ticket.ticket_subject}):</p><blockquote>${body.replace(/\n/g, '<br>')}</blockquote>`,
+                        { replyTo: from, threadId: ticket.email_thread_id, ticketNumber: ticket.ticket_number } // Используем 'from'
+                    );
+                } catch (emailError) { console.error(`Webhook: Failed to send notification to support for ticket #${ticket.ticket_number}:`, emailError); }
+            }
+        } else {
+            console.warn("Webhook /api/receive-email: sendEmail function is not defined. Notifications skipped.");
         }
 
-        console.log(`Webhook /api/receive-email: Message from ${from} added to ticket #${ticket.ticket_number}`);
+
+        console.log(`Webhook /api/receive-email: Message from ${from} successfully processed for ticket #${ticket.ticket_number}`); // Используем 'from'
         res.status(200).json({
             message: 'Email successfully processed and added to ticket.',
             ticket_number: ticket.ticket_number,
@@ -1823,14 +1931,190 @@ app.get('/api/tickets/:ticketNumber', verifyToken, async (req, res) => {
     }
 });
 
+const superAdminAuthLimiter = rateLimit({ // Переименовал для ясности
+    windowMs: 15 * 60 * 1000, // 15 минут
+    max: 5,                   // Максимум 5 попыток входа с одного IP за 15 минут
+    message: { message: 'Слишком много попыток входа. Попробуйте позже.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+app.post('/api/auth-tech', superAdminAuthLimiter, async (req, res) => {
+    const { password } = req.body;
+
+    if (!password) {
+        return res.status(400).json({ message: "Введите пароль" });
+    }
+
+    const superAdminPasswordFromEnv = process.env.TECH_PASSWORD; // Пароль из .env
+    const adminJwtSecret = process.env.ADMIN_JWT_SECRET || process.env.JWT_SECRET;
+
+    if (!superAdminPasswordFromEnv) {
+        console.error('!!! TECH_PASSWORD is not defined in .env file !!!');
+        return res.status(500).json({ message: 'Ошибка конфигурации сервера (пароль суперадмина)' });
+    }
+    if (!adminJwtSecret) {
+        console.error('!!! ADMIN_JWT_SECRET (or JWT_SECRET) is not defined in .env file !!!');
+        return res.status(500).json({ message: 'Ошибка конфигурации сервера (секрет токена)' });
+    }
+
+    try {
+        if (password === superAdminPasswordFromEnv) {
+            const payload = {
+                role: 'admin',
+            };
+            const token = jwt.sign(
+                payload,
+                adminJwtSecret, // Используем тот же секрет, что и в verifyAdminToken
+                { expiresIn: process.env.ADMIN_JWT_EXPIRES_IN || '4h' } // Время жизни токена
+            );
+
+            res.status(200).json({
+                message: 'Вход выполнен успешно',
+                token: token // Отправляем токен клиенту
+            });
+        } else {
+            res.status(401).json({ message: 'Пароль не верный' });
+        }
+    } catch (error) {
+        console.error('Error in /auth-tech:', error);
+        res.status(500).json({ message: 'Внутренняя ошибка сервера' });
+    }
+});
+
+app.get('/api/admin/tickets', verifyAdminToken, async (req, res) => {
+    const statusFilter = req.query.status;
+    const userIdFilter = req.query.userId;
+    const sortBy = req.query.sortBy || 'updated_at';
+    const sortOrder = req.query.sortOrder || 'DESC';
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const offset = (page - 1) * limit;
+
+    const selectClause = `
+        SELECT
+            t.id, t.ticket_number, t.subject, ts.name as status,
+            u.fio as user_fio, u.email as user_email, u.company as user_company,
+            t.created_at, t.updated_at, t.closed_at,
+            (SELECT tm.message FROM ticket_messages tm WHERE tm.ticket_id = t.id ORDER BY tm.created_at ASC LIMIT 1) as first_message_snippet,
+            (SELECT tm.created_at FROM ticket_messages tm WHERE tm.ticket_id = t.id ORDER BY tm.created_at DESC LIMIT 1) as last_message_at
+    `;
+    const fromClause = `
+        FROM tickets t
+        JOIN ticket_statuses ts ON t.status_id = ts.id
+        JOIN users u ON t.user_id = u.id
+    `;
+    const countSelectClause = `SELECT COUNT(t.id)`;
+
+    let whereConditions = []; // <--- ИЗМЕНЕНИЕ: Инициализируем как МАССИВ
+    const queryParams = [];
+    const countQueryParams = [];
+
+
+    if (statusFilter && statusFilter !== 'all') {
+        if (statusFilter === 'open') {
+            whereConditions.push(`ts.name != 'closed'`); // <--- ИЗМЕНЕНИЕ: Используем массив
+        } else {
+            countQueryParams.push(statusFilter); // Добавляем в параметры для count первым
+            queryParams.push(statusFilter);      // Затем в параметры для основного запроса
+            whereConditions.push(`ts.name = $${countQueryParams.length}`); // <--- Используем длину countQueryParams для индекса
+        }
+    }
+
+    if (userIdFilter && userIdFilter !== 'all') {
+        const userIdNum = parseInt(userIdFilter, 10);
+        if (!isNaN(userIdNum)) { // Проверка, что это действительно число
+            countQueryParams.push(userIdNum);
+            queryParams.push(userIdNum);
+            whereConditions.push(`t.user_id = $${countQueryParams.length}`); // <--- Используем длину countQueryParams для индекса
+        } else {
+            console.warn(`Invalid userIdFilter received: ${userIdFilter}`);
+            // Можно вернуть ошибку или просто проигнорировать этот фильтр
+        }
+    }
+
+    let whereClauseString = '';
+    if (whereConditions.length > 0) {
+        whereClauseString = 'WHERE ' + whereConditions.join(' AND ');
+    }
+
+    let query = `${selectClause} ${fromClause} ${whereClauseString}`;
+    let countQuery = `${countSelectClause} ${fromClause} ${whereClauseString}`;
+
+
+    const allowedSortByFields = ['ticket_number', 'subject', 'status', 'user_fio', 'created_at', 'updated_at', 'last_message_at'];
+    let safeSortByDbField = sortBy;
+    if (sortBy === 'status') safeSortByDbField = 'ts.name';
+    else if (sortBy === 'user_fio') safeSortByDbField = 'u.fio';
+    else if (allowedSortByFields.includes(sortBy)) safeSortByDbField = `t.${sortBy}`; // Добавляем алиас t. для полей из tickets
+    else safeSortByDbField = 't.updated_at'; // Поле из t по умолчанию
+
+    const safeSortOrder = (sortOrder.toUpperCase() === 'ASC' || sortOrder.toUpperCase() === 'DESC') ? sortOrder.toUpperCase() : 'DESC';
+    query += ` ORDER BY ${safeSortByDbField} ${safeSortOrder}, t.id ${safeSortOrder}`;
+
+    // Параметры для LIMIT и OFFSET всегда добавляются последними
+    queryParams.push(limit);
+    query += ` LIMIT $${queryParams.length}`;
+    queryParams.push(offset);
+    query += ` OFFSET $${queryParams.length}`;
+
+    let client;
+    try {
+        client = await pool.connect();
+        console.log('Executing Query:', query); // Лог для отладки основного запроса
+        console.log('Query Params:', queryParams);  // Лог для отладки параметров основного запроса
+
+        console.log('Executing Count Query:', countQuery); // Лог для отладки запроса подсчета
+        console.log('Count Query Params:', countQueryParams); // Лог для отладки параметров запроса подсчета
+
+        const ticketsResult = await client.query(query, queryParams);
+        const totalTicketsResult = await client.query(countQuery, countQueryParams);
+
+        const totalTickets = parseInt(totalTicketsResult.rows[0].count, 10);
+
+        res.status(200).json({
+            tickets: ticketsResult.rows,
+            pagination: {
+                currentPage: page,
+                totalPages: Math.ceil(totalTickets / limit),
+                totalItems: totalTickets,
+                itemsPerPage: limit
+            }
+        });
+    } catch (error) {
+        console.error('!!! UNHANDLED ERROR in /api/admin/tickets:', error); // Изменил, чтобы было видно в логах
+        res.status(500).json({ message: 'Не удалось загрузить список заявок' });
+    } finally {
+        if (client) client.release();
+    }
+});
+
+// Эндпоинт для получения списка пользователей для фильтра в админке
+app.get('/api/admin/userslist', verifyAdminToken, async (req, res) => {
+    let client;
+    try {
+        client = await pool.connect();
+        // Выбираем только необходимые поля, возможно, отсортируем по ФИО
+        const result = await client.query(
+            'SELECT id, fio, email FROM users ORDER BY fio ASC'
+        );
+        res.status(200).json({ users: result.rows });
+    } catch (error) {
+        console.error('Error fetching users list for admin filter:', error);
+        res.status(500).json({ message: 'Не удалось загрузить список пользователей' });
+    } finally {
+        if (client) client.release();
+    }
+});
+
+
 
 // --- Basic Root Route ---
 app.get('/', (req, res) => {
     res.send('API is running!');
 });
 
-// --- Error Handling Middleware (Ловит ошибки, не пойманные в роутах) ---
-// Должен быть ПОСЛЕДНИМ app.use
+
 app.use((err, req, res, next) => {
     console.error('!!! UNHANDLED ERROR:', err.stack);
     res.status(500).json({ message: 'Непредвиденная ошибка сервера' });
