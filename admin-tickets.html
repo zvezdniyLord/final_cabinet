@@ -409,6 +409,20 @@ td .status-badge {
 }
 
 
+.sidebar-button.danger-button {
+	background-color: #f8d7da;
+	color: #721c24;
+	border-color: #f5c6cb;
+	width: 10%;
+	margin-bottom: 0;	
+    }
+
+    .admin-ticket-header {
+        display: flex;
+	justify-content: space-between;
+	align-items: center;
+    }
+
 @media (max-width: 992px) { /* Изменим точку для сайдбара */
     .sidebar {
         /* Можно сделать сайдбар скрываемым или фиксированным на мобильных */
@@ -458,9 +472,10 @@ td .status-badge {
     </style>
 </head>
 <body>
-
-    <h1>Заявки в Тех. поддержке</h1>
-
+    <div class="admin-ticket-header">
+	<h1>Заявки в Тех. поддержке</h1>
+	<button id="logoutAdminBtn" class="sidebar-button danger-button">Exit</button>
+    </div>
     <div class="filters">
         <label for="statusFilter">Статус:</label>
         <select id="statusFilter">
@@ -475,6 +490,8 @@ td .status-badge {
         <select id="userFilter">
             <option value="all" selected>Все пользователи</option>
         </select>
+	<label for="companyFilterInput">Company:</label>
+	<input type="text" id="companyFilterInput" placeholder="Name Company">
         <button id="applyFilterBtn">Применить фильтр</button>
     </div>
 
@@ -514,14 +531,28 @@ const ticketsListDiv = document.getElementById('ticketsList'); // Для кар�
 const statusFilterSelect = document.getElementById('statusFilter');
 const userFilterSelect = document.getElementById('userFilter');
 const applyFilterBtn = document.getElementById('applyFilterBtn');
+const companyFilterInput = document.getElementById('companyFilterInput');
 const paginationControls = document.getElementById('paginationControls');
 const errorMessagesDiv = document.getElementById('errorMessages');
 const loadingIndicator = document.getElementById('loadingIndicator');
+const logoutAdminBtn = document.getElementById('logoutAdminBtn');
 
 let currentPage = 1;
 const itemsPerPage = 10; // Должно соответствовать 'limit' на сервере
 
 // --- Функции для работы с API и UI ---
+
+function adminLogout() {
+	localStorage.removeItem(TOKEN_KEY);
+	window.location.href = 'admin-login.html';
+}
+
+if(logoutAdminBtn) {
+
+	logoutAdminBtn.addEventListener('click', () => {
+		adminLogout();
+	});
+}
 
 // Получение токена администратора из localStorage
 function getAdminToken() {
@@ -549,6 +580,28 @@ function showLoading(isLoading) {
     if (applyFilterBtn) { // Блокируем кнопку фильтра во время загрузки
         applyFilterBtn.disabled = isLoading;
     }
+}
+
+async function fetchAndDisplayTickets(status = 'open', page = 1, userId = 'all', company = '') {
+
+ const token = getAdminToken();
+ if(!token || !userFilterSelect) return;
+ const params = new URLSearchParams({
+	status: status,
+	page: page,
+	limit: itemsPerPage,
+	sortBy: 'updated_at',
+	sortOrder: 'DESC'
+ });
+
+ if(userId && userId !== 'all') {
+	params.append('userId', userId);
+ }
+
+ if(company && company.trim() !== '') {
+	params.append('company', company.trim());
+ }
+
 }
 
 // Загрузка списка пользователей для фильтра

@@ -1985,6 +1985,7 @@ app.post('/api/auth-tech', superAdminAuthLimiter, async (req, res) => {
 app.get('/api/admin/tickets', verifyAdminToken, async (req, res) => {
     const statusFilter = req.query.status;
     const userIdFilter = req.query.userId;
+    const companyFilter = req.query.company;
     const sortBy = req.query.sortBy || 'updated_at';
     const sortOrder = req.query.sortOrder || 'DESC';
     const page = parseInt(req.query.page) || 1;
@@ -2031,6 +2032,14 @@ app.get('/api/admin/tickets', verifyAdminToken, async (req, res) => {
             console.warn(`Invalid userIdFilter received: ${userIdFilter}`);
             // Можно вернуть ошибку или просто проигнорировать этот фильтр
         }
+    }
+
+
+    if (companyFilter && companyFilter.trim() !== '') {
+	const companySearchTerm = `%${companyFilter.trim()}%`;
+	countQueryParams.push(companySearchTerm);
+	queryParams.push(companySearchTerm);
+	whereConditions.push(`u.company ILIKE $${countQueryParams.length}`);
     }
 
     let whereClauseString = '';
