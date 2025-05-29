@@ -474,7 +474,7 @@ td .status-badge {
 <body>
     <div class="admin-ticket-header">
 	<h1>Заявки в Тех. поддержке</h1>
-	<button id="logoutAdminBtn" class="sidebar-button danger-button">Exit</button>
+	<button id="logoutAdminBtn" class="sidebar-button danger-button">Выхoд</button>
     </div>
     <div class="filters">
         <label for="statusFilter">Статус:</label>
@@ -490,7 +490,7 @@ td .status-badge {
         <select id="userFilter">
             <option value="all" selected>Все пользователи</option>
         </select>
-	<label for="companyFilterInput">Company:</label>
+	<label for="companyFilterInput">Компания:</label>
 	<input type="text" id="companyFilterInput" placeholder="Name Company">
         <button id="applyFilterBtn">Применить фильтр</button>
     </div>
@@ -582,28 +582,6 @@ function showLoading(isLoading) {
     }
 }
 
-async function fetchAndDisplayTickets(status = 'open', page = 1, userId = 'all', company = '') {
-
- const token = getAdminToken();
- if(!token || !userFilterSelect) return;
- const params = new URLSearchParams({
-	status: status,
-	page: page,
-	limit: itemsPerPage,
-	sortBy: 'updated_at',
-	sortOrder: 'DESC'
- });
-
- if(userId && userId !== 'all') {
-	params.append('userId', userId);
- }
-
- if(company && company.trim() !== '') {
-	params.append('company', company.trim());
- }
-
-}
-
 // Загрузка списка пользователей для фильтра
 async function loadUsersForFilter() {
     const token = getAdminToken();
@@ -638,7 +616,7 @@ async function loadUsersForFilter() {
 }
 
 // Основная функция для получения и отображения заявок
-async function fetchAndDisplayTickets(status = 'open', page = 1, userId = 'all') {
+async function fetchAndDisplayTickets(status = 'open', page = 1, userId = 'all', company = '') {
     clearMessage();
     showLoading(true);
 
@@ -668,6 +646,10 @@ async function fetchAndDisplayTickets(status = 'open', page = 1, userId = 'all')
 
     if (userId && userId !== 'all') {
         params.append('userId', userId);
+    }
+
+    if (company && company.trim() !== '') {
+	params.append('company', company.trim());
     }
 
     try {
@@ -839,8 +821,9 @@ if (applyFilterBtn) {
     applyFilterBtn.addEventListener('click', () => {
         const selectedStatus = statusFilterSelect ? statusFilterSelect.value : 'all';
         const selectedUserId = userFilterSelect ? userFilterSelect.value : 'all';
+	const selectedCompany = companyFilterInput ? companyFilterInput.value : '';
         currentPage = 1; // Сбрасываем на первую страницу при новом фильтре
-        fetchAndDisplayTickets(selectedStatus, currentPage, selectedUserId);
+        fetchAndDisplayTickets(selectedStatus, currentPage, selectedUserId, selectedCompany);
     });
 }
 
@@ -869,7 +852,8 @@ document.addEventListener('DOMContentLoaded', () => {
     // Начальная загрузка тикетов (например, все открытые от всех пользователей)
     const initialStatus = statusFilterSelect.value || 'open';
     const initialUser = userFilterSelect.value || 'all';
-    fetchAndDisplayTickets(initialStatus, currentPage, initialUser);
+    const initialCompany = companyFilterInput ? companyFilterInput.value : '';
+    fetchAndDisplayTickets(initialStatus, currentPage, initialUser, initialCompany);
 });
 
     </script>
