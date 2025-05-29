@@ -263,8 +263,8 @@ app.post('/api/register', async (req, res) => {
     }
 
     const insertQuery = `
-        INSERT INTO users (email, fio, password_hash, position, company, activity_sphere, city, phone)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        INSERT INTO users (email, fio, password_hash, position, company, activity_sphere, city, phone, account_status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending)
         RETURNING id, email, fio;
     `;
     const values = [email, fio, hashedPassword, position, company, activity, city, phone];
@@ -275,7 +275,20 @@ app.post('/api/register', async (req, res) => {
         const result = await client.query(insertQuery, values);
         const newUser = result.rows[0];
         console.log('User registered:', { id: newUser.id, email: newUser.email });
-
+        try {
+            await sendEmail(
+                process.env.ADMIN_NOTIFICATION_EMAIL || supportEmail, // Email админа для уведомлений
+                `Новая заявка на регистрацию: ${newUser.fio}`,
+                `Пользователь ${newUser.fio} (${newUser.email}) подал заявку на регистрацию.\nКомпания: ${company}\nДолжность: ${position}\n\nПожалуйста, рассмотрите заявку в админ-панели.`,
+                `<p>Пользователь <strong>${newUser.fio}</strong> (<code>${newUser.email}</code>) подал заявку на регистрацию.</p>
+                 <p><strong>Компания:</strong> ${company || 'не указана'}</p>
+                 <p><strong>Должность:</strong> ${position || 'не указана'}</p>
+                 <p>Пожалуйста, рассмотрите заявку в админ-панели.</p>`,
+                { fromName: 'Система Регистрации ИНТ' } // Можно без saveToDb или с userId системы
+            );
+        } catch (emailError) {
+            console.error('Failed to send registration notification email to admin:', emailError);
+        }
         // Важно: НЕ логиним пользователя автоматически после регистрации в этой схеме
         // Пусть он введет логин/пароль на странице входа
         res.status(201).json({
@@ -465,7 +478,7 @@ app.post('/api/login', async (req, res) => {
         return res.status(400).json({ message: 'Необходимо указать email и пароль' });
     }
 
-    const findUserQuery = 'SELECT id, email, fio, password_hash FROM users WHERE email = $1';
+    const findUserQuery = 'SELECT id, email, fio, password_hash, account_status FROM users WHERE email = $1';
     let client;
 
     try {
@@ -478,6 +491,20 @@ app.post('/api/login', async (req, res) => {
         }
 
         const user = result.rows[0];
+        // Проверка статуса аккаунта ПЕРЕД проверкой пароля
+        if (user.account_status !== 'active') {
+            let statusMessage = 'Ваш аккаунт неактивен.';
+            if (user.account_status === 'pending_approval') {
+                statusMessage = 'Ваш аккаунт ожидает подтверждения администратором.';
+            } else if (user.account_status === 'suspended') {
+                statusMessage = 'Ваш аккаунт заблокирован.';
+            } else if (user.account_status === 'rejected') {
+                statusMessage = 'В регистрации вашего аккаунта было отказано.';
+            }
+            console.warn(`Login attempt failed (account not active: ${user.account_status}): ${email}`);
+            return res.status(403).json({ message: statusMessage }); // 403 Forbidden
+        }
+
         const isMatch = await bcrypt.compare(password, user.password_hash);
 
         if (!isMatch) {
