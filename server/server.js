@@ -264,7 +264,7 @@ app.post('/api/register', async (req, res) => {
 
     const insertQuery = `
         INSERT INTO users (email, fio, password_hash, position, company, activity_sphere, city, phone, account_status)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending_approval')
         RETURNING id, email, fio;
     `;
     const values = [email, fio, hashedPassword, position, company, activity, city, phone];
@@ -289,10 +289,8 @@ app.post('/api/register', async (req, res) => {
         } catch (emailError) {
             console.error('Failed to send registration notification email to admin:', emailError);
         }
-        // Важно: НЕ логиним пользователя автоматически после регистрации в этой схеме
-        // Пусть он введет логин/пароль на странице входа
         res.status(201).json({
-            message: 'Регистрация прошла успешно! Теперь вы можете войти.',
+            message: 'Спасибо за регистрацию, как только администратор подвердит Ваш аккаунт, Вы сможете войти в систему',
             user: { // Возвращаем минимум информации
                 id: newUser.id,
                 email: newUser.email,
@@ -2143,6 +2141,119 @@ app.get('/api/admin/userslist', verifyAdminToken, async (req, res) => {
     }
 });
 
+app.get('/api/admin/users', verifyAdminToken, async (req, res) => {
+    const statusFilter = req.query.status; // например, 'pending_approval', 'active', 'all'
+    let query = `SELECT id, fio, email, company, position, phone, created_at, account_status FROM users`;
+    const queryParams = [];
+
+    if (statusFilter && statusFilter !== 'all') {
+        queryParams.push(statusFilter);
+        query += ` WHERE account_status = $1`;
+    }
+    query += ` ORDER BY created_at DESC`;
+    // Добавьте пагинацию, если пользователей много
+
+    let client;
+    try {
+        client = await pool.connect();
+        const result = await client.query(query, queryParams);
+        res.status(200).json({ users: result.rows });
+    } catch (error) {
+        console.error(error + " /api/admin/users")
+    } finally {
+        if (client) client.release();
+    }
+});
+
+app.put('/api/admin/users/:userId/approve', verifyAdminToken, async (req, res) => {
+    const { userId } = req.params;
+    let client;
+    try {
+        client = await pool.connect();
+        // Проверяем, что пользователь существует и ожидает подтверждения
+        const userResult = await client.query(
+            "SELECT email, fio, account_status FROM users WHERE id = $1",
+            [userId]
+        );
+        if (userResult.rows.length === 0) {
+            return res.status(404).json({ message: 'Пользователь не найден' });
+        }
+        if (userResult.rows[0].account_status !== 'pending_approval') {
+            return res.status(400).json({ message: 'Пользователь не ожидает подтверждения или уже обработан.' });
+        }
+
+        await client.query(
+            "UPDATE users SET account_status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = $1",
+            [userId]
+        );
+
+        // Опционально: отправить email пользователю об активации
+        const user = userResult.rows[0];
+        try {
+            await sendEmail(
+                user.email,
+                'Ваш аккаунт успешно активирован!',
+                `Здравствуйте, ${user.fio}!\n\nВаш аккаунт на сайте ИНТ был успешно активирован. Теперь вы можете войти в систему.\n\nСпасибо!`,
+                `<p>Здравствуйте, ${user.fio}!</p><p>Ваш аккаунт на сайте ИНТ был успешно активирован. Теперь вы можете войти в систему.</p><p>Спасибо!</p>`,
+                { fromName: 'Администрация ИНТ' }
+            );
+        } catch (emailError) {
+            console.error(`Failed to send account activation email to ${user.email}:`, emailError);
+        }
+
+        res.status(200).json({ message: 'Регистрация пользователя одобрена.' });
+    } catch (error) {
+        console.error(error)
+    } finally {
+        if (client) client.release();
+    }
+});
+
+app.put('/api/admin/users/:userId/reject', verifyAdminToken, async (req, res) => {
+    const { userId } = req.params;
+    // Причина отклонения (опционально, из req.body.reason)
+    const { reason } = req.body;
+    let client;
+    try {
+        client = await pool.connect();
+         const userResult = await client.query( // Проверка как в approve
+            "SELECT email, fio, account_status FROM users WHERE id = $1",
+            [userId]
+        );
+        if (userResult.rows.length === 0) return res.status(404).json({ message: 'Пользователь не найден' });
+        if (userResult.rows[0].account_status !== 'pending_approval') return res.status(400).json({ message: 'Пользователь не ожидает подтверждения.' });
+
+
+        // Можно либо удалить пользователя, либо сменить статус на 'rejected'
+        // Вариант 1: Смена статуса
+        await client.query(
+            "UPDATE users SET account_status = 'rejected', updated_at = CURRENT_TIMESTAMP WHERE id = $1",
+            [userId]
+        );
+        // Вариант 2: Удаление (ОСТОРОЖНО!)
+        // await client.query("DELETE FROM users WHERE id = $1", [userId]);
+
+        // Опционально: отправить email пользователю об отклонении
+        const user = userResult.rows[0];
+        try {
+            await sendEmail(
+                user.email,
+                'Заявка на регистрацию отклонена',
+                `Здравствуйте, ${user.fio}.\n\nК сожалению, ваша заявка на регистрацию на сайте ИНТ была отклонена.${reason ? '\nПричина: ' + reason : ''}\n\nС уважением,\nАдминистрация ИНТ`,
+                // ... HTML версия ...
+                { fromName: 'Администрация ИНТ' }
+            );
+        } catch (emailError) {
+            console.error(`Failed to send account rejection email to ${user.email}:`, emailError);
+        }
+
+        res.status(200).json({ message: 'Регистрация пользователя отклонена.' });
+    } catch (error) {
+        console.error(error)
+    } finally {
+        if (client) client.release();
+    }
+});
 
 
 // --- Basic Root Route ---
