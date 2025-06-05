@@ -2255,6 +2255,305 @@ app.put('/api/admin/users/:userId/reject', verifyAdminToken, async (req, res) =>
     }
 });
 
+app.get('/api/admin/tickets/:ticketNumber/details', verifyAdminToken, async (req, res) => {
+    // const adminId = req.admin.id; // Если нужно для логирования или чего-то еще
+    const { ticketNumber } = req.params;
+
+    let client;
+    try {
+        client = await pool.connect();
+
+        // Получаем информацию о заявке
+        const ticketResult = await client.query(
+            `SELECT t.id, t.ticket_number, t.subject, ts.name as status,
+                    t.created_at, t.updated_at, t.closed_at, t.user_id, u.fio as user_fio, u.email as user_email,
+                    t.email_thread_id
+             FROM tickets t
+             JOIN ticket_statuses ts ON t.status_id = ts.id
+             JOIN users u ON t.user_id = u.id  -- Добавили JOIN с users для информации о пользователе
+             WHERE t.ticket_number = $1`,
+            [ticketNumber]
+        );
+
+        if (ticketResult.rows.length === 0) {
+            return res.status(404).json({ message: 'Заявка не найдена' });
+        }
+
+        const ticket = ticketResult.rows[0];
+
+        // Получаем все сообщения в заявке
+        const messagesResult = await client.query(
+            `SELECT tm.id, tm.sender_type, tm.sender_id, tm.sender_email, tm.message,
+                    tm.created_at, tm.is_read, tm.email_id,
+                    CASE
+                        WHEN tm.sender_type = 'user' THEN u_sender.fio
+                        WHEN tm.sender_type = 'support' THEN COALESCE(s_sender.fio, 'Техподдержка') -- Имя сотрудника или 'Техподдержка'
+                        ELSE 'Система'
+                    END as sender_name
+             FROM ticket_messages tm
+             LEFT JOIN users u_sender ON tm.sender_id = u_sender.id AND tm.sender_type = 'user'
+             LEFT JOIN users s_sender ON tm.sender_id = s_sender.id AND tm.sender_type = 'support' -- Для имени сотрудника поддержки
+             WHERE tm.ticket_id = $1
+             ORDER BY tm.created_at ASC`,
+            [ticket.id]
+        );
+
+        // Получаем вложения для каждого сообщения (этот код у вас уже есть, можно переиспользовать)
+        const messageIds = messagesResult.rows.map(m => m.id);
+        let attachmentsResult = { rows: [] };
+
+        if (messageIds.length > 0) {
+            attachmentsResult = await client.query(
+                `SELECT id, message_id, file_name, file_path, file_size, mime_type
+                 FROM ticket_attachments WHERE message_id = ANY($1::int[])`, // Явно указываем тип массива
+                [messageIds]
+            );
+        }
+
+        const attachmentsByMessageId = {};
+        attachmentsResult.rows.forEach(attachment => {
+            if (!attachmentsByMessageId[attachment.message_id]) {
+                attachmentsByMessageId[attachment.message_id] = [];
+            }
+            attachmentsByMessageId[attachment.message_id].push({
+                id: attachment.id,
+                file_name: attachment.file_name,
+                file_path: attachment.file_path, // Для админа может быть полезен путь
+                file_size: attachment.file_size,
+                mime_type: attachment.mime_type
+                // Можно добавить URL для скачивания, если файлы доступны через GET эндпоинт
+                // download_url: `/api/admin/attachments/${attachment.id}` // Пример
+            });
+        });
+
+        const messagesWithAttachments = messagesResult.rows.map(message => {
+            return {
+                ...message,
+                attachments: attachmentsByMessageId[message.id] || []
+            };
+        });
+
+        // Администратору не нужно отмечать сообщения как прочитанные таким образом,
+        // это логика для пользователя.
+
+        res.status(200).json({
+            ticket: { // Расширяем информацию о тикете для админа
+                id: ticket.id,
+                ticket_number: ticket.ticket_number,
+                subject: ticket.subject,
+                status: ticket.status,
+                created_at: ticket.created_at,
+                updated_at: ticket.updated_at,
+                closed_at: ticket.closed_at,
+                user_id: ticket.user_id,
+                user_fio: ticket.user_fio,
+                user_email: ticket.user_email,
+                thread_id: ticket.email_thread_id
+            },
+            messages: messagesWithAttachments
+        });
+
+    } catch (error) {
+        console.error('Error fetching ticket details for admin:', error);
+        res.status(500).json({ message: 'Не удалось загрузить информацию о заявке для администратора' });
+    } finally {
+        if (client) client.release();
+    }
+});
+
+app.post('/api/admin/tickets/:ticketNumber/reply', verifyAdminToken, upload.array('attachments', 5), async (req, res) => {
+    const { ticketNumber } = req.params;
+    const { message } = req.body; // Текст ответа от администратора
+    const adminUserId = req.admin.id; // ID администратора из токена (если есть и вы его туда кладете)
+                                      // Если в adminToken только role: 'admin', нужно получить ID админа иначе,
+                                      // или решить, как идентифицировать сотрудника поддержки.
+                                      // Пока предположим, что ID админа не критичен для sender_id в ticket_messages
+                                      // и будем использовать null или специальное значение, если adminId нет.
+
+    if (!message || message.trim() === '') {
+        return res.status(400).json({ message: 'Текст ответа не может быть пустым.' });
+    }
+
+    let client;
+    try {
+        client = await pool.connect();
+        await client.query('BEGIN');
+
+        // 1. Найти тикет
+        const ticketResult = await client.query(
+            `SELECT t.id, t.subject as ticket_subject, t.user_id, u.email as user_email, u.fio as user_fio,
+                    t.email_thread_id, ts.name as current_status
+             FROM tickets t
+             JOIN users u ON t.user_id = u.id
+             JOIN ticket_statuses ts ON t.status_id = ts.id
+             WHERE t.ticket_number = $1`,
+            [ticketNumber]
+        );
+
+        if (ticketResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ message: 'Заявка не найдена.' });
+        }
+        const ticket = ticketResult.rows[0];
+
+        // 2. Проверить, не закрыт ли тикет (опционально, можно разрешить отвечать в закрытые, тогда они переоткроются)
+        if (ticket.current_status === 'closed') {
+            // Можно либо запретить, либо автоматически переоткрыть
+            // Пока запретим, но вы можете изменить логику
+            await client.query('ROLLBACK');
+            return res.status(400).json({ message: 'Нельзя ответить на закрытую заявку. Сначала переоткройте её.' });
+        }
+
+        // 3. Получить ID сотрудника поддержки (если это реализовано)
+        // Предположим, что `req.admin` содержит `userId` для администратора/сотрудника поддержки
+        // Если нет, то sender_id может быть null или ID специального "системного" пользователя поддержки.
+        let supportStaffId = null;
+        let supportStaffEmail = supportEmail; // Глобальная переменная supportEmail
+        let supportStaffName = 'Техподдержка ИНТ';
+
+        // Если у вас есть информация о сотруднике в токене или вы можете ее получить:
+        if (req.admin && req.admin.userId) { // Предполагаем, что в ADMIN_JWT_SECRET токене есть userId
+            const staffResult = await client.query('SELECT id, email, fio FROM users WHERE id = $1 AND (is_support = TRUE OR role = \'admin\')', [req.admin.userId]);
+            if (staffResult.rows.length > 0) {
+                supportStaffId = staffResult.rows[0].id;
+                supportStaffEmail = staffResult.rows[0].email;
+                supportStaffName = staffResult.rows[0].fio || supportStaffName;
+            } else {
+                console.warn(`Admin user ID ${req.admin.userId} from token not found as support staff. Using default support sender.`);
+            }
+        } else {
+             console.warn(`Admin user ID not found in token. Using default support sender. Ensure ADMIN_JWT_SECRET payload includes userId for staff attribution.`);
+        }
+
+
+        // 4. Сохранить сообщение от техподдержки
+        // Сохраняем входящее письмо в таблицу emails (имитируем, что это "исходящее" от системы, но полученное от админа)
+        // Это нужно, чтобы корректно работал threadId и replyTo в функции sendEmail
+        const emailLogResult = await client.query(
+            `INSERT INTO emails (thread_id, subject, body, from_email, to_email, is_outgoing, created_at, user_id)
+             VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP, $7)
+             RETURNING id`,
+            [
+                ticket.email_thread_id,
+                `Re: ${ticket.ticket_subject}`, // Тема для лога
+                message,
+                supportStaffEmail,        // От кого (почта поддержки)
+                ticket.user_email,        // Кому (почта пользователя)
+                true,                     // Это исходящее письмо
+                supportStaffId            // ID сотрудника поддержки, если есть
+            ]
+        );
+        const emailId = emailLogResult.rows[0].id;
+
+        const messageInsertResult = await client.query(
+            `INSERT INTO ticket_messages (ticket_id, sender_type, sender_id, sender_email, message, email_id)
+             VALUES ($1, 'support', $2, $3, $4, $5)
+             RETURNING id, created_at`,
+            [ticket.id, supportStaffId, supportStaffEmail, message, emailId]
+        );
+        const newMessage = messageInsertResult.rows[0];
+
+        // 5. Обработать вложения (если есть)
+        const emailAttachments = [];
+        if (req.files && req.files.length > 0) {
+            for (const file of req.files) {
+                await client.query(
+                    `INSERT INTO ticket_attachments (message_id, file_name, file_path, file_size, mime_type)
+                     VALUES ($1, $2, $3, $4, $5)`,
+                    [newMessage.id, file.originalname, file.path, file.size, file.mimetype]
+                );
+                emailAttachments.push({ filename: file.originalname, path: file.path });
+            }
+        }
+
+        // 6. Обновить статус тикета на "Ожидает ответа от пользователя" (waiting_for_user)
+        // и время последнего обновления
+        const waitingStatusResult = await client.query('SELECT id FROM ticket_statuses WHERE name = $1', ['waiting_for_user']);
+        if (waitingStatusResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            console.error('Status "waiting_for_user" not found in database.');
+            return res.status(500).json({ message: 'Ошибка конфигурации: статус "waiting_for_user" не найден.' });
+        }
+        const waitingStatusId = waitingStatusResult.rows[0].id;
+
+        await client.query(
+            'UPDATE tickets SET status_id = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+            [waitingStatusId, ticket.id]
+        );
+
+        await client.query('COMMIT');
+
+        // 7. Отправить email пользователю
+        try {
+            const emailSubjectToUser = `Ответ по вашей заявке #${ticketNumber}: ${ticket.ticket_subject}`;
+            const emailTextToUser =
+`Здравствуйте, ${ticket.user_fio || 'Пользователь'}!
+
+Сотрудник техподдержки (${supportStaffName}, ${supportStaffEmail}) ответил на вашу заявку #${ticketNumber}:
+
+${message}
+
+---
+Вы можете ответить на это письмо или перейти в личный кабинет на сайте.
+С уважением,
+Техподдержка ИНТ`;
+
+            const emailHtmlToUser =
+`<p>Здравствуйте, ${ticket.user_fio || 'Пользователь'}!</p>
+<p>Сотрудник техподдержки (<strong>${supportStaffName}</strong>, ${supportStaffEmail}) ответил на вашу заявку #${ticketNumber} (Тема: ${ticket.ticket_subject}):</p>
+<blockquote style="border-left: 2px solid #ccc; padding-left: 10px; margin-left: 5px;">
+  ${message.replace(/\n/g, '<br>')}
+</blockquote>
+<p>---</p>
+<p>Вы можете ответить на это письмо или перейти в личный кабинет на сайте.</p>
+<p>С уважением,<br>Техподдержка ИНТ</p>`;
+
+            await sendEmail(
+                ticket.user_email,
+                emailSubjectToUser,
+                emailTextToUser,
+                emailHtmlToUser,
+                {
+                    fromName: supportStaffName, // Имя отправителя от техподдержки
+                    replyTo: supportStaffEmail, // Email для ответа пользователя
+                    attachments: emailAttachments,
+                    threadId: ticket.email_thread_id,
+                    ticketNumber: ticketNumber,
+                    inReplyToMessageId: null, // Сюда можно подставить Message-ID предыдущего письма от пользователя, если он есть
+                    // saveToDb: true, // Уже сохранили в emailLogResult
+                    userIdForLog: supportStaffId // Для лога в БД, если нужно
+                }
+            );
+             console.log(`Admin reply for ticket #${ticketNumber} sent to user ${ticket.user_email}`);
+        } catch (emailError) {
+            // Не откатываем транзакцию, т.к. ответ уже сохранен. Просто логируем ошибку.
+            console.error(`Failed to send email notification to user for ticket #${ticketNumber} reply:`, emailError);
+            // Можно добавить флаг в сообщение/тикет, что email не был отправлен.
+        }
+
+        res.status(201).json({
+            message: 'Ответ успешно отправлен и сохранен.',
+            newMessage: {
+                id: newMessage.id,
+                sender_type: 'support',
+                sender_name: supportStaffName,
+                sender_email: supportStaffEmail,
+                message: message,
+                created_at: newMessage.created_at,
+                attachments: emailAttachments.map(a => ({ file_name: a.filename, file_path: a.path })) // Возвращаем информацию о вложениях
+            },
+            new_status: 'waiting_for_user'
+        });
+
+    } catch (error) {
+        if (client) await client.query('ROLLBACK');
+        console.error('Error sending admin reply to ticket:', error);
+        res.status(500).json({ message: 'Ошибка сервера при отправке ответа.' });
+    } finally {
+        if (client) client.release();
+    }
+});
+
 
 // --- Basic Root Route ---
 app.get('/', (req, res) => {

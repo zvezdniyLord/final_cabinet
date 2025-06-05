@@ -51,7 +51,30 @@
         <tbody id="ticketsTableBody">
         </tbody>
     </table>
-
+    <div id="ticketModal" class="modal" style="display:none;">
+        <div class="modal-content">
+            <span class="close-button" onclick="closeTicketModal()">&times;</span>
+            <h2 id="modalTicketSubject">Тема тикета</h2>
+            <p><strong>Номер:</strong> <span id="modalTicketNumber"></span></p>
+            <p><strong>Пользователь:</strong> <span id="modalTicketUser"></span> (<span id="modalTicketUserEmail"></span>)</p>
+            <p><strong>Статус:</strong> <span id="modalTicketStatus"></span></p>
+            <hr>
+            <div id="modalMessagesContainer" class="messages-history">
+                <!-- Сообщения будут здесь -->
+            </div>
+            <hr>
+            <div class="reply-form">
+                <h3>Ваш ответ:</h3>
+                <textarea id="adminReplyMessage" rows="5" placeholder="Введите ваш ответ здесь..."></textarea>
+                <div class="form-group">
+                    <label for="adminReplyAttachments">Вложения (до 5 файлов):</label>
+                    <input type="file" id="adminReplyAttachments" multiple accept=".pdf,.doc,.docx,.xls,.xlsx,.png,.jpg,.jpeg">
+                </div>
+                <button id="sendAdminReplyButton" class="btn-send-reply">Отправить ответ</button>
+                <div id="replyStatusMessage" class="status-message"></div>
+            </div>
+        </div>
+    </div>
     <div class="pagination" id="paginationControls">
     </div>
 
@@ -73,8 +96,230 @@ const errorMessagesDiv = document.getElementById('errorMessages');
 const loadingIndicator = document.getElementById('loadingIndicator');
 const logoutAdminBtn = document.getElementById('logoutAdminBtn');
 
+const ticketModal = document.getElementById('ticketModal');
+const modalTicketSubject = document.getElementById('modalTicketSubject');
+const modalTicketNumber = document.getElementById('modalTicketNumber');
+const modalTicketUser = document.getElementById('modalTicketUser');
+const modalTicketUserEmail = document.getElementById('modalTicketUserEmail');
+const modalTicketStatus = document.getElementById('modalTicketStatus');
+const modalMessagesContainer = document.getElementById('modalMessagesContainer');
+const adminReplyMessage = document.getElementById('adminReplyMessage');
+const adminReplyAttachments = document.getElementById('adminReplyAttachments');
+const sendAdminReplyButton = document.getElementById('sendAdminReplyButton');
+const replyStatusMessage = document.getElementById('replyStatusMessage');
+
+let currentOpenTicketNumber = null;
+
 let currentPage = 1;
 const itemsPerPage = 10; // Должно соответствовать 'limit' на сервере
+
+
+function renderAdminTickets(tickets) { // Ваша функция рендеринга списка тикетов
+    const ticketsTableBody = document.getElementById('adminTicketsTableBody'); // Убедитесь, что ID правильный
+    ticketsTableBody.innerHTML = '';
+
+    if (!tickets || tickets.length === 0) {
+        ticketsTableBody.innerHTML = '<tr><td colspan="8" class="text-center">Заявки не найдены.</td></tr>';
+        return;
+    }
+
+    tickets.forEach(ticket => {
+        const row = ticketsTableBody.insertRow();
+        // ... (ваши ячейки для id, ticket_number, subject, user_fio, status и т.д.)
+        row.insertCell().textContent = ticket.id;
+        row.insertCell().textContent = ticket.ticket_number;
+        row.insertCell().textContent = ticket.subject;
+        row.insertCell().textContent = ticket.user_fio + (ticket.user_company ? ` (${ticket.user_company})` : '');
+        row.insertCell().textContent = ticket.status;
+        row.insertCell().textContent = new Date(ticket.updated_at).toLocaleString('ru-RU');
+        // ...
+
+        const actionsCell = row.insertCell();
+        const viewButton = document.createElement('button');
+        viewButton.textContent = 'Просмотр/Ответить';
+        viewButton.classList.add('btn', 'btn-info', 'btn-sm'); // Пример классов Bootstrap
+        viewButton.onclick = () => openTicketModal(ticket.ticket_number);
+        actionsCell.appendChild(viewButton);
+    });
+}
+
+
+async function openTicketModal(ticketNumber) {
+    currentOpenTicketNumber = ticketNumber;
+    replyStatusMessage.textContent = '';
+    adminReplyMessage.value = '';
+    adminReplyAttachments.value = null; // Сбрасываем поле для файлов
+
+    const token = getAdminToken(); // Ваша функция получения токена админа
+    if (!token) {
+        alert('Ошибка: Токен администратора не найден.');
+        return;
+    }
+
+    ticketModal.style.display = 'block';
+    modalMessagesContainer.innerHTML = '<p>Загрузка сообщений...</p>'; // Индикатор загрузки
+
+    try {
+        const response = await fetch(`${SERVER_API}/api/admin/tickets/${ticketNumber}/details`, {
+            headers: { 'Authorization': `Bearer ${token}` }
+        });
+        if (!response.ok) {
+            const errData = await response.json();
+            throw new Error(errData.message || `Ошибка ${response.status}`);
+        }
+        const data = await response.json();
+
+        modalTicketSubject.textContent = data.ticket.subject;
+        modalTicketNumber.textContent = data.ticket.ticket_number;
+        modalTicketUser.textContent = data.ticket.user_fio;
+        modalTicketUserEmail.textContent = data.ticket.user_email;
+        modalTicketStatus.textContent = data.ticket.status;
+
+        renderMessagesInModal(data.messages);
+
+    } catch (error) {
+        console.error('Ошибка при загрузке деталей тикета:', error);
+        modalMessagesContainer.innerHTML = `<p style="color: red;">Ошибка загрузки: ${error.message}</p>`;
+    }
+}
+
+function renderMessagesInModal(messages) {
+    modalMessagesContainer.innerHTML = '';
+    if (!messages || messages.length === 0) {
+        modalMessagesContainer.innerHTML = '<p>Сообщений нет.</p>';
+        return;
+    }
+
+    messages.forEach(msg => {
+        const messageDiv = document.createElement('div');
+        messageDiv.classList.add('message-item', msg.sender_type); // 'user' или 'support'
+
+        const senderP = document.createElement('p');
+        senderP.classList.add('message-sender');
+        senderP.textContent = `${msg.sender_name} (${msg.sender_email || 'N/A'})`;
+
+        const timeSpan = document.createElement('span');
+        timeSpan.classList.add('message-time');
+        timeSpan.textContent = new Date(msg.created_at).toLocaleString('ru-RU');
+
+        const textP = document.createElement('p');
+        textP.classList.add('message-text');
+        textP.textContent = msg.message;
+
+        messageDiv.appendChild(senderP);
+        messageDiv.appendChild(textP);
+
+        if (msg.attachments && msg.attachments.length > 0) {
+            const attachmentsDiv = document.createElement('div');
+            attachmentsDiv.classList.add('message-attachments');
+            msg.attachments.forEach(att => {
+                const link = document.createElement('a');
+                link.classList.add('attachment-link');
+                // Важно: Ссылка для скачивания должна вести на защищенный эндпоинт,
+                // который проверяет права и отдает файл.
+                // Пока просто показываем имя файла.
+                // link.href = `/api/download/attachment/${att.id}`; // Пример
+                link.textContent = `Вложение: ${att.file_name} (${(att.file_size / 1024).toFixed(1)} KB)`;
+                // link.target = '_blank'; // Открывать в новой вкладке
+                attachmentsDiv.appendChild(link);
+            });
+            messageDiv.appendChild(attachmentsDiv);
+        }
+        messageDiv.appendChild(timeSpan);
+        modalMessagesContainer.appendChild(messageDiv);
+    });
+    // Прокрутка к последнему сообщению
+    modalMessagesContainer.scrollTop = modalMessagesContainer.scrollHeight;
+}
+
+function closeTicketModal() {
+    ticketModal.style.display = 'none';
+    currentOpenTicketNumber = null;
+}
+
+// Закрытие модального окна по клику вне его (опционально)
+window.onclick = function(event) {
+    if (event.target == ticketModal) {
+        closeTicketModal();
+    }
+}
+
+sendAdminReplyButton.onclick = async () => {
+    if (!currentOpenTicketNumber) return;
+
+    const messageText = adminReplyMessage.value.trim();
+    if (!messageText) {
+        replyStatusMessage.textContent = 'Сообщение не может быть пустым.';
+        replyStatusMessage.style.color = 'red';
+        return;
+    }
+
+    const token = getAdminToken();
+    if (!token) {
+        replyStatusMessage.textContent = 'Ошибка: Токен администратора не найден.';
+        replyStatusMessage.style.color = 'red';
+        return;
+    }
+
+    const formData = new FormData();
+    formData.append('message', messageText);
+
+    const files = adminReplyAttachments.files;
+    if (files.length > 0) {
+        if (files.length > 5) {
+             replyStatusMessage.textContent = 'Можно прикрепить не более 5 файлов.';
+             replyStatusMessage.style.color = 'red';
+             return;
+        }
+        for (let i = 0; i < files.length; i++) {
+            formData.append('attachments', files[i]);
+        }
+    }
+
+    sendAdminReplyButton.disabled = true;
+    replyStatusMessage.textContent = 'Отправка...';
+    replyStatusMessage.style.color = 'blue';
+
+    try {
+        const response = await fetch(`${SERVER_API}/api/admin/tickets/${currentOpenTicketNumber}/reply`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${token}`
+                // 'Content-Type': 'multipart/form-data' // FormData устанавливает это автоматически с boundary
+            },
+            body: formData
+        });
+
+        const result = await response.json();
+
+        if (!response.ok) {
+            throw new Error(result.message || `Ошибка ${response.status}`);
+        }
+
+        replyStatusMessage.textContent = result.message || 'Ответ успешно отправлен!';
+        replyStatusMessage.style.color = 'green';
+        adminReplyMessage.value = ''; // Очищаем поле ввода
+        adminReplyAttachments.value = null; // Сбрасываем файлы
+
+        // Обновляем сообщения в модальном окне
+        // (можно либо запросить все заново, либо добавить новое сообщение локально)
+        // Простой вариант: запросить заново
+        openTicketModal(currentOpenTicketNumber);
+
+        // Обновить статус тикета в основном списке (если нужно немедленное отображение)
+        fetchAdminTickets(); // Ваша функция для перезагрузки списка тикетов
+
+
+    } catch (error) {
+        console.error('Ошибка при отправке ответа:', error);
+        replyStatusMessage.textContent = `Ошибка: ${error.message}`;
+        replyStatusMessage.style.color = 'red';
+    } finally {
+        sendAdminReplyButton.disabled = false;
+    }
+};
+
+
 
 // --- Функции для работы с API и UI ---
 
@@ -239,7 +484,7 @@ function renderTicket(ticket) {
     if (ticketsListDiv) {
         const card = document.createElement('div');
         card.className = 'ticket-card';
-        card.onclick = () => viewTicketDetails(ticket.ticket_number);
+        card.onclick = () => openTicketModal(ticket.ticket_number);
 
         let statusClass = ticket.status.toLowerCase().replace(/\s+/g, '_');
         let statusText = ticket.status.toUpperCase(); // Или ваш локализованный текст
@@ -280,7 +525,7 @@ function renderTicket(ticket) {
             <td>${escapeHtml(ticket.user_company) || 'N/A'}</td>
             <td>${new Date(ticket.created_at).toLocaleString()}</td>
             <td>${new Date(ticket.updated_at).toLocaleString()}</td>
-            <td><button class="action-button view-button" onclick="viewTicketDetails('${escapeHtml(ticket.ticket_number)}')">Просмотр</button></td>
+            <td><button class="action-button view-button" onclick="openTicketModal('${escapeHtml(ticket.ticket_number)}')">Просмотр</button></td>
         `;
          // Добавьте стили для .action-button и .view-button в CSS, если нужно
     }
